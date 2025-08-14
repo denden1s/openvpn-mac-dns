@@ -18,61 +18,132 @@ echo "*** starting update-resolv-config script ***"
 PATH=$PATH:/usr/sbin/
 NMSRVRS=()
 SRCHS=()
+BACKUP_DIR="/etc/openvpn/dns_backup"
+mkdir -p "$BACKUP_DIR"
 
 # Get adapter list
-IFS=$'\n' read -d '' -ra adapters < <(networksetup -listallnetworkservices |grep -v denotes) || true
+IFS=$'\n' read -d '' -ra adapters <<< "$((networksetup -listallnetworkservices |grep -v denotes) || true)"
 
 split_into_parts()
 {
-        part1="$1"
-        part2="$2"
-        part3="$3"
+  part1="$1"
+  part2="$2"
+  part3="$3"
 }
 
+# For hard reset and etc problems - restore DNS settings manually
+create_restore_script()
+{
+  echo '#!/bin/bash
+restore_dns()
+{
+  IFS=$'\''\n'\'' read -d '\'''\'' -ra adapters <<< "$((networksetup -listallnetworkservices |grep -v denotes) || true)"
+  BACKUP_DIR="/etc/openvpn/dns_backup"
+  for adapter in "${adapters[@]}"
+  do
+    echo "Restoring DNS settings for $adapter"
+    if [[ -f "$BACKUP_DIR/$adapter.dns" ]]; then
+      networksetup -setdnsservers "$adapter" $(cat "$BACKUP_DIR/$adapter.dns")
+    else
+      networksetup -setdnsservers "$adapter" empty
+    fi
+    if [[ -f "$BACKUP_DIR/$adapter.search" ]]; then
+      networksetup -setsearchdomains "$adapter" $(cat "$BACKUP_DIR/$adapter.search")
+    else
+      networksetup -setsearchdomains "$adapter" empty
+    fi
+  done
+  echo "Please remove folder /etc/openvpn/dns_backup manually"
+}
+restore_dns' > restore_dns.sh
+  chmod +x restore_dns.sh
+}
+
+backup_dns()
+{
+  for adapter in "${adapters[@]}"
+  do
+    dns="$(networksetup -getdnsservers "$adapter")"
+    domains="$(networksetup -getsearchdomains "$adapter")"
+    if [[ "$dns" != "There aren't any DNS Servers set on $adapter." ]]; then
+      networksetup -getdnsservers "$adapter" > "$BACKUP_DIR/$adapter.dns"
+    fi
+    if [[ "$domains" != "There aren't any Search Domains set on $adapter." ]]; then
+      networksetup -getsearchdomains "$adapter" > "$BACKUP_DIR/$adapter.search"
+    fi
+  done
+  create_restore_script
+}
+
+# Restore DNS settings and remove backup dir and manual restoring script
+restore_dns()
+{
+  for adapter in "${adapters[@]}"
+  do
+    if [[ -f "$BACKUP_DIR/$adapter.dns" ]]; then
+      networksetup -setdnsservers "$adapter" $(cat "$BACKUP_DIR/$adapter.dns")
+    else
+      networksetup -setdnsservers "$adapter" empty
+    fi
+    if [[ -f "$BACKUP_DIR/$adapter.search" ]]; then
+      networksetup -setsearchdomains "$adapter" $(cat "$BACKUP_DIR/$adapter.search")
+    else
+      networksetup -setsearchdomains "$adapter" empty
+    fi
+  done
+  rm -rf "$BACKUP_DIR"
+  rm ./restore_dns.sh
+}
+
+# Add new DNS settings for current DNS list
 update_all_dns()
 {
-        for adapter in "${adapters[@]}"
-        do
-        echo updating dns for $adapter
-        # set dns server to the vpn dns server
-        if [[ "${SRCHS[@]}" ]]; then
-			networksetup -setsearchdomains "$adapter" "${SRCHS[@]}"
-        fi
-        if [[ "${NMSRVRS[@]}" ]]; then
-			networksetup -setdnsservers "$adapter" "${NMSRVRS[@]}"
-		fi
-        done
+  for adapter in "${adapters[@]}"
+  do
+    if [[ "${SRCHS[@]}" ]]; then
+      if [[ -f "$BACKUP_DIR/$adapter.search" ]] && [[ "$(cat "$BACKUP_DIR/$adapter.search")" != *"${SRCHS[@]}"* ]]; then
+        networksetup -setsearchdomains "$adapter" "${SRCHS[@]}" $(networksetup -getsearchdomains "$adapter")
+      else
+        networksetup -setsearchdomains "$adapter" "${SRCHS[@]}"
+      fi
+    fi
+    if [[ "${NMSRVRS[@]}" ]]; then
+      if [[ -f "$BACKUP_DIR/$adapter.dns" ]] && [[ "$(cat "$BACKUP_DIR/$adapter.dns")" != *"${NMSRVRS[@]}"* ]]; then
+        networksetup -setdnsservers "$adapter" "${NMSRVRS[@]}" $(networksetup -getdnsservers "$adapter")
+      else
+        networksetup -setdnsservers "$adapter" "${NMSRVRS[@]}"
+      fi
+    fi
+  done
 }
 
-clear_all_dns()
+# Parse new DNS settings
+parse_openvpn_options()
 {
-        for adapter in "${adapters[@]}"
-        do
-        echo updating dns for $adapter
-        networksetup -setdnsservers "$adapter" empty
-        networksetup -setsearchdomains "$adapter" empty
-        done
+  for optionvarname in ${!foreign_option_*} ; do
+    option="${!optionvarname}"
+    echo "$option"
+    split_into_parts $option
+    if [ "$part1" = "dhcp-option" ] ; then
+      if [ "$part2" = "DNS" ] ; then
+        NMSRVRS=(${NMSRVRS[@]} $part3)
+      elif [ "$part2" = "DOMAIN" ] || [ "$part2" = "DOMAIN-SEARCH" ]; then
+        SRCHS=(${SRCHS[@]} $part3)
+      fi
+    fi
+  done
 }
 
 case "$script_type" in
   up)
-        for optionvarname in ${!foreign_option_*} ; do
-                option="${!optionvarname}"
-                echo "$option"
-                split_into_parts $option
-                if [ "$part1" = "dhcp-option" ] ; then
-                        if [ "$part2" = "DNS" ] ; then
-                                NMSRVRS=(${NMSRVRS[@]} $part3)
-                        elif [ "$part2" = "DOMAIN" ] || [ "$part2" = "DOMAIN-SEARCH" ]; then
-                                SRCHS=(${SRCHS[@]} $part3)
-                        fi
-                fi
-        done
-        update_all_dns
-        ;;
+    backup_dns
+    parse_openvpn_options
+    update_all_dns
+    :
+    ;;
   down)
-        clear_all_dns
-        ;;
+    restore_dns
+    ;;
 esac
 
 echo "*** finished update-resolv-config script ***"
